@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Hız & Gecikme Etüdü Pro</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- XLSX (SheetJS) -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+  <style>
+    :root { --primary:#2563eb; --danger:#dc2626; --success:#16a34a; --bg:#f8fafc; }
+    body{font-family:'Inter',sans-serif;margin:0;background:var(--bg);color:#1e293b;overflow:hidden;}
+    header{background:white;padding:12px 16px;border-bottom:1px solid #e2e8f0;box-shadow:0 1px 3px rgba(0,0,0,.1);z-index:1000;position:relative;}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;}
+    .input-group{display:flex;flex-direction:column;gap:4px;}
+    label{font-size:11px;font-weight:600;text-transform:uppercase;color:#64748b;}
+    input,select,button{padding:10px;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;outline:none;}
+    button{cursor:pointer;background:white;font-weight:600;transition:all .2s;border:1px solid #cbd5e1;}
+    button:active{transform:translateY(1px);}
+    .btn-primary{background:var(--primary);color:white;border:none;width:100px;}
+    .btn-danger{background:var(--danger);color:white;border:none;width:100px;}
+    #map{height:calc(100vh - 280px);width:100%;background:#e5e7eb;}
+    .panel{background:white;padding:16px;border-top:1px solid #e2e8f0;height:180px;overflow-y:auto;box-sizing:border-box;}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin-top:12px;}
+    .reason-btn{font-size:11px;padding:8px 4px;background:#f1f5f9;border:1px solid #e2e8f0;line-height:1.2;}
+    .reason-btn strong{display:block;margin-bottom:2px;color:var(--primary);}
+    .status-bar{display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-top:8px;font-weight:500;}
+    .badge{padding:4px 10px;border-radius:20px;font-size:11px;background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;}
+    .badge-active{background:#fee2e2;color:#991b1b;border-color:#fecaca;animation:pulse 1.5s infinite;}
+    @keyframes pulse{0%{opacity:1}50%{opacity:.6}100%{opacity:1}}
+    @media (max-width:600px){
+      .input-group{width:100%}
+      #map{height:calc(100vh - 360px)}
+      .panel{height:260px}
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+  <div class="row">
+    <div class="input-group" style="flex:2;min-width:200px;">
+      <label>Sürücü & Güzergah</label>
+      <div style="display:flex;gap:4px;">
+        <input id="fullName" placeholder="Ad Soyad" style="width:40%"/>
+        <input id="routeName" placeholder="Güzergah İsmi" style="flex:1"/>
+      </div>
+    </div>
+    <div class="input-group">
+      <label>Yön</label>
+      <select id="direction">
+        <option value="Gidis">Gidiş</option>
+        <option value="Donus">Dönüş</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;">
+      <button class="btn-primary" id="btnStart">BAŞLAT</button>
+      <button class="btn-danger" id="btnFinish" style="display:none;">BİTİR</button>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div id="statusText">Harita yükleniyor...</div>
+    <div id="gpsStatus" class="badge">GPS Bekleniyor...</div>
+  </div>
+</header>
+
+<div id="map"></div>
+
+<div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+    <div class="row">
+      <button id="btnCP">📍 CP Ekle</button>
+      <button id="btnStopEnd" disabled style="background:#f8fafc">⏹ Durak Bitir</button>
+      <span class="badge" id="stopBadge">Durak Yok</span>
+    </div>
+    <div class="row">
+      <button onclick="exportData('json')">JSON</button>
+      <button onclick="exportData('xlsx')">XLSX</button>
+      <button onclick="exportData('kml')">KML</button>
+    </div>
+  </div>
+
+  <div class="grid" id="reasonGrid"></div>
+</div>
+
+<script>
+  const REASONS = {
+    TS:"Trafik Sinyali", KZ:"Kaza/Arıza", YY:"Yaya Geçişi",
+    DR:"Dur İşareti", SD:"Dönüş", P:"Parklanma",
+    MN:"Minibüs", YO:"Yoğunluk", D:"Otobüs Durağı", YV:"Yol Verme"
+  };
+
+  let state = {
+    isRunning:false,
+    runInfo:null,
+    runStartMs:null,
+    runStartISO:null,
+    track:[],               // {ms, iso, lat, lon, acc, speed}
+    controlPoints:[],       // {id, ms, iso, lat, lon}
+    stops:[],               // {reason, startMs, startISO, startLat, startLon, endMs, endISO, endLat, endLon, duration}
+    activeStop:null,        // {reason, startMs, startISO, startLat, startLon}
+    lastPos:null            // {ms, iso, lat, lon}
+  };
+
+  const map = L.map('map').setView([41.0082, 28.9784], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom:19, attribution:'© OSM' }).addTo(map);
+  setTimeout(() => map.invalidateSize(), 500);
+
+  const trackLine = L.polyline([], { color:'#2563eb', weight:5 }).addTo(map);
+  let userMarker = L.circleMarker([0,0], { radius:9, color:'#fff', fillColor:'#2563eb', fillOpacity:1, weight:3 }).addTo(map);
+
+  const $ = id => document.getElementById(id);
+  const pad2 = n => String(n).padStart(2,'0');
+  function nowMs(){ return Date.now(); }
+  function nowISO(){ return new Date().toISOString(); } // makineye uygun
+  function nowClock(){ // HH:MM:SS
+    const d=new Date();
+    return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  }
+  function elapsedSec(ms){ return state.runStartMs ? Math.max(0, Math.floor((ms - state.runStartMs)/1000)) : 0; }
+
+  function updateStatus(msg, isError=false){
+    $('statusText').textContent = msg;
+    $('statusText').style.color = isError ? '#dc2626' : '#1e293b';
+  }
+
+  // reason buttons
+  Object.entries(REASONS).forEach(([code, label]) => {
+    const btn = document.createElement("button");
+    btn.className = "reason-btn";
+    btn.innerHTML = `<strong>${code}</strong>${label}`;
+    btn.onclick = () => handleStopStart(code);
+    $('reasonGrid').appendChild(btn);
+  });
+
+  function onLocationSuccess(pos){
+    const { latitude:lat, longitude:lon, accuracy:acc, speed } = pos.coords;
+    const ms = nowMs();
+    const iso = nowISO();
+
+    state.lastPos = { ms, iso, lat, lon };
+    updateStatus("GPS Aktif");
+    $('gpsStatus').textContent = `Hata: ±${Math.round(acc)}m`;
+
+    userMarker.setLatLng([lat, lon]);
+
+    if(state.isRunning){
+      state.track.push({ ms, iso, lat, lon, acc, speed: speed || 0 });
+      trackLine.addLatLng([lat, lon]);
+      map.panTo([lat, lon]);
+    }
+  }
+  function onLocationError(err){ updateStatus("GPS Hatası: " + err.message, true); }
+
+  if("geolocation" in navigator){
+    navigator.geolocation.watchPosition(onLocationSuccess, onLocationError, { enableHighAccuracy:true, maximumAge:0, timeout:10000 });
+  }
+
+  $('btnStart').onclick = () => {
+    if(!state.lastPos) return alert("GPS bekleniyor...");
+
+    const name = $('fullName').value.trim();
+    const route = $('routeName').value.trim();
+    const direction = $('direction').value;
+
+    if(!name || !route) return alert("Ad Soyad ve Güzergah İsmi gir.");
+
+    // reset
+    state.isRunning = true;
+    state.runStartMs = nowMs();
+    state.runStartISO = nowISO();
+    state.runInfo = { name, route, direction };
+
+    state.track = [];
+    state.controlPoints = [];
+    state.stops = [];
+    state.activeStop = null;
+    trackLine.setLatLngs([]);
+
+    $('btnStart').style.display='none';
+    $('btnFinish').style.display='block';
+
+    updateStatus(`Run başladı: ${route} (${direction}) - ${nowClock()}`);
+  };
+
+  $('btnFinish').onclick = () => {
+    if(state.activeStop) handleStopEnd();
+    state.isRunning = false;
+
+    $('btnStart').style.display='block';
+    $('btnFinish').style.display='none';
+
+    updateStatus(`Run bitti: ${nowClock()}. XLSX/KML alabilirsin.`);
+  };
+
+  $('btnCP').onclick = () => {
+    if(!state.isRunning || !state.lastPos) return;
+
+    const cpId = state.controlPoints.length + 1;
+    const ms = nowMs();
+    const iso = nowISO();
+
+    const cp = { id:cpId, ms, iso, lat:state.lastPos.lat, lon:state.lastPos.lon };
+    state.controlPoints.push(cp);
+
+    L.marker([cp.lat, cp.lon]).addTo(map).bindTooltip(`CP-${cpId}`, { permanent:true }).openTooltip();
+  };
+
+  function handleStopStart(reason){
+    if(!state.isRunning || !state.lastPos) return;
+
+    // aktif durak varsa bitir (sebep değişimi)
+    if(state.activeStop) handleStopEnd();
+
+    const ms = nowMs();
+    const iso = nowISO();
+
+    state.activeStop = {
+      reason,
+      startMs: ms,
+      startISO: iso,
+      startLat: state.lastPos.lat,
+      startLon: state.lastPos.lon
+    };
+
+    $('stopBadge').className = 'badge badge-active';
+    $('btnStopEnd').disabled = false;
+    $('stopBadge').textContent = `${reason}: 0s`;
+
+    // durak başlangıcı için mavi nokta
+    L.circleMarker([state.activeStop.startLat, state.activeStop.startLon], { radius:6 }).addTo(map);
+  }
+
+  function handleStopEnd(){
+    if(!state.activeStop) return;
+
+    const endMs = nowMs();
+    const endISO = nowISO();
+    const duration = Math.max(0, Math.floor((endMs - state.activeStop.startMs)/1000));
+
+    const endLat = state.lastPos ? state.lastPos.lat : state.activeStop.startLat;
+    const endLon = state.lastPos ? state.lastPos.lon : state.activeStop.startLon;
+
+    state.stops.push({
+      reason: state.activeStop.reason,
+      startMs: state.activeStop.startMs,
+      startISO: state.activeStop.startISO,
+      startLat: state.activeStop.startLat,
+      startLon: state.activeStop.startLon,
+      endMs, endISO, endLat, endLon,
+      duration
+    });
+
+    // kırmızı nokta: durak bitiş noktasını işaretle
+    L.circleMarker([endLat, endLon], { radius:6, color:'red' }).addTo(map);
+
+    state.activeStop = null;
+    $('stopBadge').className='badge';
+    $('stopBadge').textContent='Durak Yok';
+    $('btnStopEnd').disabled = true;
+  }
+
+  $('btnStopEnd').onclick = handleStopEnd;
+
+  setInterval(() => {
+    if(state.activeStop){
+      const dur = Math.floor((nowMs() - state.activeStop.startMs)/1000);
+      $('stopBadge').textContent = `${state.activeStop.reason}: ${dur}s`;
+    }
+  }, 1000);
+
+  // --- Timeline: CP + stops (CP altında sıralı) ---
+  function assignCpNoForEventMs(ms){
+    // event ms anındaki en son CP'yi bul
+    let cpNo = 0;
+    for(const cp of state.controlPoints){
+      if(cp.ms <= ms) cpNo = cp.id;
+      else break;
+    }
+    return cpNo;
+  }
+
+  function buildExcelRows(){
+    // CP’leri zaman sıralı varsayıyoruz (push sırası)
+    const rows = [];
+    const runMeta = state.runInfo || {name:"", route:"", direction:""};
+
+    // Header satırı (meta)
+    rows.push(["Gözlemci", runMeta.name, "", "", "", "", "", ""]);
+    rows.push(["Güzergah", runMeta.route, "", "", "", "", "", ""]);
+    rows.push(["Yön", runMeta.direction, "", "", "", "", "", ""]);
+    rows.push(["Başlangıç (ISO)", state.runStartISO || "", "", "", "", "", "", ""]);
+    rows.push(["", "", "", "", "", "", "", ""]);
+    // kolon başlıkları
+    rows.push(["CP_No","Olay","Kod","Saat","Geçen Süre (sn)","Bekleme (sn)","Koordinat (lat,lon)","Açıklama"]);
+
+    // CP satırları + durak satırları birlikte (zaman çizelgesi)
+    const events = [];
+
+    for(const cp of state.controlPoints){
+      events.push({
+        ms: cp.ms,
+        type: "CP",
+        cpNo: cp.id,
+        code: `CP-${cp.id}`,
+        time: new Date(cp.ms).toLocaleTimeString('tr-TR', {hour12:false}),
+        elapsed: elapsedSec(cp.ms),
+        wait: "",
+        lat: cp.lat, lon: cp.lon,
+        desc: "Kontrol Noktası"
+      });
+    }
+
+    for(const s of state.stops){
+      const cpNo = assignCpNoForEventMs(s.startMs);
+      events.push({
+        ms: s.startMs,
+        type: "DURAK",
+        cpNo,
+        code: s.reason,
+        time: new Date(s.startMs).toLocaleTimeString('tr-TR', {hour12:false}),
+        elapsed: elapsedSec(s.startMs),
+        wait: s.duration,
+        lat: s.startLat, lon: s.startLon,
+        desc: (REASONS[s.reason] || "")
+      });
+    }
+
+    // Zamana göre sırala
+    events.sort((a,b)=>a.ms-b.ms);
+
+    // Satırlara bas
+    for(const e of events){
+      rows.push([
+        e.cpNo,
+        e.type,
+        e.code,
+        e.time,
+        e.elapsed,
+        e.wait,
+        `${e.lat.toFixed(6)},${e.lon.toFixed(6)}`,
+        e.desc
+      ]);
+    }
+
+    return rows;
+  }
+
+  function exportXLSX(){
+    if(!state.runInfo) return alert("Önce run başlat.");
+
+    const rows = buildExcelRows();
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+
+    // Basit kolon genişlikleri
+    ws["!cols"] = [
+      {wch:6},{wch:8},{wch:10},{wch:10},{wch:16},{wch:14},{wch:22},{wch:20}
+    ];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Etud");
+
+    const safeRoute = (state.runInfo.route || "Etud").replace(/[^\w\-]+/g,"_");
+    const fn = `${safeRoute}_${state.runInfo.direction}_${Date.now()}.xlsx`;
+    XLSX.writeFile(wb, fn);
+  }
+
+  // --- KML: CP klasörleri altında duraklar ---
+  function esc(s){
+    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&apos;");
+  }
+
+  function generateKMLGrouped(){
+    const meta = state.runInfo || {route:"Etud", direction:""};
+    const name = `${meta.route} - ${meta.direction}`;
+
+    const trackCoords = state.track.map(p => `${p.lon},${p.lat},0`).join("\n");
+
+    // Her CP için bir folder
+    const folders = new Map(); // cpNo -> {cp, stops[]}
+    for(const cp of state.controlPoints){
+      folders.set(cp.id, { cp, stops: [] });
+    }
+    // CP'siz olaylar için 0
+    folders.set(0, folders.get(0) || { cp:null, stops: [] });
+
+    for(const s of state.stops){
+      const cpNo = assignCpNoForEventMs(s.startMs);
+      if(!folders.has(cpNo)) folders.set(cpNo, { cp:null, stops: [] });
+      folders.get(cpNo).stops.push(s);
+    }
+
+    let kml = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document>
+  <name>${esc(name)}</name>
+
+  <Placemark>
+    <name>Güzergah</name>
+    <Style><LineStyle><width>4</width></LineStyle></Style>
+    <LineString><tessellate>1</tessellate><coordinates>
+${trackCoords}
+    </coordinates></LineString>
+  </Placemark>
+`;
+
+    // CP folders in order
+    const cpNos = Array.from(folders.keys()).sort((a,b)=>a-b);
+    for(const cpNo of cpNos){
+      const item = folders.get(cpNo);
+      const folderName = cpNo === 0 ? "CP-YOK" : `CP-${cpNo}`;
+      kml += `  <Folder><name>${esc(folderName)}</name>\n`;
+
+      // CP placemark
+      if(item.cp){
+        kml += `    <Placemark>
+      <name>${esc(`CP-${item.cp.id}`)}</name>
+      <Point><coordinates>${item.cp.lon},${item.cp.lat},0</coordinates></Point>
+    </Placemark>\n`;
+      }
+
+      // Stops under that CP (sorted)
+      const stopsSorted = (item.stops || []).slice().sort((a,b)=>a.startMs-b.startMs);
+      for(const s of stopsSorted){
+        const title = `${s.reason} (${s.duration}s)`;
+        kml += `    <Placemark>
+      <name>${esc(title)}</name>
+      <description>${esc(REASONS[s.reason] || "")}</description>
+      <Point><coordinates>${s.startLon},${s.startLat},0</coordinates></Point>
+    </Placemark>\n`;
+      }
+
+      kml += `  </Folder>\n`;
+    }
+
+    kml += `</Document></kml>`;
+    return kml;
+  }
+
+  function exportJSON(){
+    const payload = {
+      runInfo: state.runInfo,
+      runStartISO: state.runStartISO,
+      track: state.track,
+      controlPoints: state.controlPoints,
+      stops: state.stops
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:"application/json"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `Etud_${Date.now()}.json`;
+    a.click();
+  }
+
+  function exportKML(){
+    const kml = generateKMLGrouped();
+    const blob = new Blob([kml], {type:"application/vnd.google-earth.kml+xml"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `Etud_${Date.now()}.kml`;
+    a.click();
+  }
+
+  // unified export
+  function exportData(type){
+    if(type === "json") exportJSON();
+    if(type === "xlsx") exportXLSX();
+    if(type === "kml") exportKML();
+  }
+  window.exportData = exportData;
+</script>
+</body>
+</html>
